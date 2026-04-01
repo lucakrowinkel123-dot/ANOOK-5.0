@@ -1,10 +1,10 @@
-// === ANOUK-Ca (Carrier) Mothership Script ===
+// === ANOOK-Ca (Carrier) Mothership Script ===
 // Data LCDs: 25 lines per LCD, r195g255b255 font, 0.695 size, 1.0 padding
 
-const string LCD_TAG = "ANOUK-Ca LCD Data";
-const string FIELD_DB_NAME = "ANOUK-Ca A-Field DB";
+const string LCD_TAG = "ANOOK-Ca LCD Data";
+const string FIELD_DB_NAME = "ANOOK-Ca A-Field DB";
 const int MAX_ASTEROIDS_PER_BLOCK = 5;
-const string PATHFINDER_CHANNEL = "ANOUK-Ca_PathFinder_Channel";
+const string PATHFINDER_CHANNEL = "ANOOK-Ca_PathFinder_Channel";
 
 // Lists for asteroid databases and LCDs
 List<IMyTimerBlock> asteroidDatabases = new List<IMyTimerBlock>();
@@ -29,12 +29,12 @@ public void Main(string argument, UpdateType updateSource)
     // --- BLOCK LOOKUPS ---
     // Find remote control, asteroid databases, and field DB for this zone
     List<IMyRemoteControl> remotes = new List<IMyRemoteControl>();
-    GridTerminalSystem.GetBlocksOfType(remotes, r => r.CustomName.Contains("ANOUK-Ca Remote Control"));
+    GridTerminalSystem.GetBlocksOfType(remotes, r => r.CustomName.Contains("ANOOK-Ca Remote Control"));
     remote = remotes.Count > 0 ? remotes[0] : null;
     string currentZone = remote != null ? GetAsteroidZone(remote.GetPosition()) : "Unknown";
     asteroidDatabases.Clear();
     GridTerminalSystem.GetBlocksOfType(asteroidDatabases, b =>
-        b.CustomName.StartsWith("ANOUK-Ca " + currentZone + " A-DB HD"));
+        b.CustomName.StartsWith("ANOOK-Ca " + currentZone + " A-DB HD"));
     outputLCDs.Clear();
     GridTerminalSystem.GetBlocksOfType(outputLCDs, l => l.CustomName.StartsWith(LCD_TAG));
     outputLCDs.Sort((a, b) => a.CustomName.CompareTo(b.CustomName));
@@ -43,7 +43,7 @@ public void Main(string argument, UpdateType updateSource)
     fieldDatabase = fieldBlocks.Count > 0 ? fieldBlocks[0] : null;
 
     // --- SAFETY CHECKS ---
-    if (remote == null) { Echo("ANOUK-Ca Remote Control not found"); return; }
+    if (remote == null) { Echo("ANOOK-Ca Remote Control not found"); return; }
     if (fieldDatabase == null) { Echo("Field database block not found."); return; }
     if (asteroidDatabases.Count == 0) { Echo("No asteroid database blocks found for zone: " + currentZone); return; }
 
@@ -732,12 +732,10 @@ void SendReturnPath()
     double entryClose = fieldIni.Get("Settings", "EntryCloseDistance").ToDouble(0.5);
     double pathClose = fieldIni.Get("Settings", "PathCloseDistance").ToDouble(2.5);
     double staggerClose = fieldIni.Get("Settings", "StaggerCloseDistance").ToDouble(0.5);
-    double siteClose = fieldIni.Get("Settings", "SiteCloseDistance").ToDouble(0.5);
 
     // Gather: Entry, Stagger, Paths (orientations included)
     string entry = ini.Get(section, $"ExcavationSiteEntry{n}").ToString();
     string stagger = ini.ContainsKey(section, $"ExcavationSiteStagger{n}") ? ini.Get(section, $"ExcavationSiteStagger{n}").ToString() : "";
-    string site = ini.ContainsKey(section, $"ExcavationSite{n}") ? ini.Get(section, $"ExcavationSite{n}").ToString() : "";
     List<string> pathList = new List<string>();
     int idx = 1;
     while (ini.ContainsKey(section, $"ExcavationSitePath{n}_{idx}"))
@@ -770,8 +768,9 @@ void SendReturnPath()
 
     if (!string.IsNullOrWhiteSpace(entry)) addPoint(entry, entryClose);
 
-    // Add final site as the end-point, if it exists
-    if (!string.IsNullOrWhiteSpace(site)) addPoint(site, siteClose);
+    // Deliberately do NOT append ExcavationSiteN (orientation|cornerA|cornerB)
+    // to the return path. Corner points define the mining job area and are not
+    // navigational path waypoints.
 
     // Flatten to Path|<gps>|<orient>|<close>|...
     List<string> all = new List<string>();
