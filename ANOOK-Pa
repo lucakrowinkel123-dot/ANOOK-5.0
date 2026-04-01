@@ -1,10 +1,10 @@
-const string LCD_PATH_NAME = "ANOUK-PF LCD 1"; 
-const string LCD_CONFIRM_NAME = "ANOUK-PF LCD 2"; 
-const string INDICATOR_NAME = "ANOUK-PF Indicator Light"; 
-const string SOUND_BLOCK_NAME = "ANOUK-PF Sound Block"; 
-const string SENSOR_TAG = "ANOUK-PF Sensor"; // Ensure your sensor has this name
-const string PATHFINDER_CHANNEL = "ANOUK-Ca_PathFinder_Channel"; 
-const string REMOTE_TAG = "ANOUK-PF Remote Control"; 
+const string LCD_PATH_NAME = "ANOOK-PF LCD 1"; 
+const string LCD_CONFIRM_NAME = "ANOOK-PF LCD 2"; 
+const string INDICATOR_NAME = "ANOOK-PF Indicator Light"; 
+const string SOUND_BLOCK_NAME = "ANOOK-PF Sound Block"; 
+const string SENSOR_TAG = "ANOOK-PF Sensor"; // Ensure your sensor has this name
+const string PATHFINDER_CHANNEL = "ANOOK-Ca_PathFinder_Channel"; 
+const string REMOTE_TAG = "ANOOK-PF Remote Control"; 
 const double CLOSE_ENOUGH_DEFAULT = 1.0; 
 
 // PID TUNING FOR STABILITY
@@ -13,6 +13,20 @@ const double gyroP = 0.5; const double gyroI = 0.002; const double gyroD = 0.5; 
 IMyTextPanel lcdPath; IMyTextPanel lcdConfirm; IMyLightingBlock indicatorLight; IMySoundBlock soundBlock; IMyRemoteControl remote; 
 IMySensorBlock sensor; // Added sensor reference
 GyroControl gyroControl;
+List<IMyGyro> cachedGyros = new List<IMyGyro>();
+
+// Block lookup cache (refresh periodically so we still recover from grid changes)
+int tickCounter = 0;
+const int BLOCK_SCAN_INTERVAL_TICKS = 60; // ~6s on Update10
+
+// Return autopilot state (reusable framework for future automation flows)
+enum AutoState { Off, NavigatingToStagger, AligningAtStagger }
+AutoState autoState = AutoState.Off;
+int autoTargetIndex = -1;
+Vector3D autoTargetPos = Vector3D.Zero;
+Vector3D autoAlignForward = Vector3D.Forward;
+Vector3D autoAlignUp = Vector3D.Up;
+double autoCloseEnough = CLOSE_ENOUGH_DEFAULT;
 
 bool blinkRequested = false; int blinkTicks = 0; Color blinkColor = new Color(0, 255, 0); 
 
@@ -24,7 +38,7 @@ List<double> pathCloseEnoughs = new List<double>();
 double pathMaxSpeed = -1; 
 
 // ---- RECORDING MODE STATE ---- 
-bool recordingActive = false; bool recordingPaused = false; 
+bool recordingActive = false; bool recordingPaused = false; bool recordingAwaitingConfirm = false;
 Vector3D recordingLastGPS = Vector3D.Zero; double recordingTimer = 0; 
 const double RECORDING_INTERVAL = 10.0; const double RECORDING_DISTANCE = 25.0; 
 
@@ -39,21 +53,13 @@ Vector3D setupPos2 = Vector3D.Zero;
 public Program() { 
     Runtime.UpdateFrequency = UpdateFrequency.Update10; 
     IGC.RegisterBroadcastListener(PATHFINDER_CHANNEL); 
+    RefreshBlocks(true);
 } 
 
 public void Main(string argument, UpdateType updateSource) { 
-    lcdPath = GridTerminalSystem.GetBlockWithName(LCD_PATH_NAME) as IMyTextPanel; 
-    lcdConfirm = GridTerminalSystem.GetBlockWithName(LCD_CONFIRM_NAME) as IMyTextPanel; 
-    indicatorLight = GridTerminalSystem.GetBlockWithName(INDICATOR_NAME) as IMyLightingBlock; 
-    remote = GridTerminalSystem.GetBlockWithName(REMOTE_TAG) as IMyRemoteControl; 
-    sensor = GridTerminalSystem.GetBlockWithName(SENSOR_TAG) as IMySensorBlock; // Initialize sensor
-    soundBlock = GridTerminalSystem.GetBlockWithName(SOUND_BLOCK_NAME) as IMySoundBlock; 
-
-    if (remote != null && gyroControl == null) {
-        List<IMyGyro> gyros = new List<IMyGyro>();
-        GridTerminalSystem.GetBlocksOfType(gyros);
-        gyroControl = new GyroControl(remote, gyros);
-    }
+    tickCounter++;
+    bool forceScan = (tickCounter % BLOCK_SCAN_INTERVAL_TICKS) == 0 || remote == null || gyroControl == null;
+    RefreshBlocks(forceScan);
 
     double deltaTime = Runtime.TimeSinceLastRun.TotalSeconds; 
     string cmd = (argument ?? "").Trim(); 
@@ -103,6 +109,8 @@ public void Main(string argument, UpdateType updateSource) {
         StopOverrides();
     } 
     else if (cmd.Equals("PF_ReturnRequest", StringComparison.OrdinalIgnoreCase)) { commandPrefix = "PathfinderReturnRequest"; isSendCommand = true; } 
+    else if (cmd.Equals("PF_AutoReturnToStaggerAndResume", StringComparison.OrdinalIgnoreCase)) { StartAutoReturnToStagger(); } 
+    else if (cmd.Equals("PF_AutoReturnCancel", StringComparison.OrdinalIgnoreCase)) { CancelAutoReturn(); } 
     else if (cmd.Equals("PF_MaxSpeedRequest", StringComparison.OrdinalIgnoreCase)) { commandPrefix = "PathfinderMaxSpeedRequest"; isSendCommand = true; } 
     else if (cmd.Equals("PF_ExcavationSitePathStartRecording", StringComparison.OrdinalIgnoreCase)) { StartRecordingMode(); } 
     else if (cmd.Equals("PF_ExcavationSitePathStopRecording", StringComparison.OrdinalIgnoreCase)) { StopRecordingMode(); } 
@@ -139,12 +147,13 @@ public void Main(string argument, UpdateType updateSource) {
 
     // --- SOFT LOCK & RECORDING LOGIC --- 
     if (isSoftLocked && remote != null) ApplySoftLock(deltaTime);
+    HandleAutoReturn(deltaTime);
 
-    if (recordingActive && !recordingPaused && remote != null) { 
+    if (recordingActive && !recordingPaused && !recordingAwaitingConfirm && remote != null) { 
         recordingTimer += deltaTime; 
         if (recordingTimer >= RECORDING_INTERVAL) { 
             var dist = (remote.GetPosition() - recordingLastGPS).Length(); 
-            if (dist >= RECORDING_DISTANCE) { SendPFExcavationSitePathAdd(); recordingPaused = true; } 
+            if (dist >= RECORDING_DISTANCE) { SendPFExcavationSitePathAdd(); recordingAwaitingConfirm = true; } 
         } 
     } 
     OutputPathStatus(); 
@@ -168,6 +177,22 @@ void ConfigureSensorVisuals(bool active) {
     }
 }
 
+void RefreshBlocks(bool force)
+{
+    if (!force) return;
+
+    lcdPath = GridTerminalSystem.GetBlockWithName(LCD_PATH_NAME) as IMyTextPanel;
+    lcdConfirm = GridTerminalSystem.GetBlockWithName(LCD_CONFIRM_NAME) as IMyTextPanel;
+    indicatorLight = GridTerminalSystem.GetBlockWithName(INDICATOR_NAME) as IMyLightingBlock;
+    remote = GridTerminalSystem.GetBlockWithName(REMOTE_TAG) as IMyRemoteControl;
+    sensor = GridTerminalSystem.GetBlockWithName(SENSOR_TAG) as IMySensorBlock;
+    soundBlock = GridTerminalSystem.GetBlockWithName(SOUND_BLOCK_NAME) as IMySoundBlock;
+
+    cachedGyros.Clear();
+    GridTerminalSystem.GetBlocksOfType(cachedGyros);
+    gyroControl = remote != null ? new GyroControl(remote, cachedGyros) : null;
+}
+
 // ... [Remainder of your GyroControl, PID, and Helper classes/methods stay exactly the same] ...
 
 void ApplySoftLock(double dt) {
@@ -189,8 +214,85 @@ void ApplySoftLock(double dt) {
     } else StopThrusterOverrides();
 }
 
-void StartRecordingMode() { recordingActive = true; recordingPaused = true; recordingTimer = 0; recordingLastGPS = remote != null ? remote.GetPosition() : Vector3D.Zero; SendPFExcavationSitePathAdd(); Echo("[Recording Mode] Started."); } 
-void StopRecordingMode() { recordingActive = false; recordingPaused = false; recordingTimer = 0; recordingLastGPS = Vector3D.Zero; Echo("[Recording Mode] Stopped."); } 
+void StartRecordingMode() { recordingActive = true; recordingPaused = false; recordingAwaitingConfirm = true; recordingTimer = 0; recordingLastGPS = remote != null ? remote.GetPosition() : Vector3D.Zero; SendPFExcavationSitePathAdd(); Echo("[Recording Mode] Started (awaiting confirm)."); } 
+void StopRecordingMode() { recordingActive = false; recordingPaused = false; recordingAwaitingConfirm = false; recordingTimer = 0; recordingLastGPS = Vector3D.Zero; Echo("[Recording Mode] Stopped."); } 
+
+void StartAutoReturnToStagger()
+{
+    if (remote == null) { Echo("[AutoReturn] No remote."); return; }
+    if (pathGPS.Count == 0 || pathOrientations.Count == 0) { Echo("[AutoReturn] No path loaded."); return; }
+
+    // Return payload is ordered with stagger first.
+    autoTargetIndex = 0;
+    autoTargetPos = pathGPS[autoTargetIndex];
+    autoCloseEnough = autoTargetIndex < pathCloseEnoughs.Count ? pathCloseEnoughs[autoTargetIndex] : CLOSE_ENOUGH_DEFAULT;
+
+    Vector3D f, u;
+    if (!TryParseOrientation(pathOrientations[autoTargetIndex], out f, out u))
+    {
+        Echo("[AutoReturn] Bad stagger orientation.");
+        return;
+    }
+    autoAlignForward = f;
+    autoAlignUp = u;
+
+    StopRecordingMode();
+    StopOverrides();
+    StartRemoteAutoPilot(autoTargetPos);
+    autoState = AutoState.NavigatingToStagger;
+    Echo("[AutoReturn] Navigating to stagger.");
+}
+
+void CancelAutoReturn()
+{
+    autoState = AutoState.Off;
+    if (remote != null) remote.SetAutoPilotEnabled(false);
+    StopOverrides();
+    Echo("[AutoReturn] Cancelled.");
+}
+
+void HandleAutoReturn(double dt)
+{
+    if (autoState == AutoState.Off || remote == null) return;
+
+    if (autoState == AutoState.NavigatingToStagger)
+    {
+        double d = Vector3D.Distance(remote.GetPosition(), autoTargetPos);
+        if (d <= Math.Max(autoCloseEnough, 1.0))
+        {
+            remote.SetAutoPilotEnabled(false);
+            autoState = AutoState.AligningAtStagger;
+            Echo("[AutoReturn] At stagger. Aligning...");
+        }
+        return;
+    }
+
+    if (autoState == AutoState.AligningAtStagger)
+    {
+        gyroControl?.FaceVectors(autoAlignForward, autoAlignUp, dt);
+        double forwardErr = Math.Acos(MathHelper.Clamp(Vector3D.Dot(remote.WorldMatrix.Forward, autoAlignForward), -1, 1)) * (180 / Math.PI);
+        double upErr = Math.Acos(MathHelper.Clamp(Vector3D.Dot(remote.WorldMatrix.Up, autoAlignUp), -1, 1)) * (180 / Math.PI);
+        if (forwardErr <= 2.5 && upErr <= 3.0)
+        {
+            gyroControl?.Reset();
+            autoState = AutoState.Off;
+            StartRecordingMode();
+            Echo("[AutoReturn] Aligned. Recording resumed.");
+        }
+    }
+}
+
+void StartRemoteAutoPilot(Vector3D target)
+{
+    if (remote == null) return;
+    remote.SetCollisionAvoidance(true);
+    remote.FlightMode = FlightMode.OneWay;
+    remote.SetDockingMode(false);
+    remote.ClearWaypoints();
+    remote.AddWaypoint(target, "PF_AutoReturn_Stagger");
+    if (pathMaxSpeed > 0) remote.SpeedLimit = (float)pathMaxSpeed;
+    remote.SetAutoPilotEnabled(true);
+}
 
 void SendPFExcavationSitePathAdd() { 
     if (remote == null) return; 
@@ -218,6 +320,26 @@ void HandlePathMessage(string msg) {
     pathMaxSpeed = -1; IGC.SendBroadcastMessage(PATHFINDER_CHANNEL, "PathfinderMaxSpeedRequest"); Echo("Path stored."); 
 } 
 
+bool TryParseOrientation(string orientation, out Vector3D forward, out Vector3D up)
+{
+    forward = Vector3D.Forward;
+    up = Vector3D.Up;
+    if (string.IsNullOrWhiteSpace(orientation)) return false;
+    var parts = orientation.Split(',');
+    if (parts.Length < 3) return false;
+    double yawDeg, pitchDeg, rollDeg;
+    if (!double.TryParse(parts[0], out yawDeg)) return false;
+    if (!double.TryParse(parts[1], out pitchDeg)) return false;
+    if (!double.TryParse(parts[2], out rollDeg)) return false;
+    float yaw = MathHelper.ToRadians((float)yawDeg);
+    float pitch = MathHelper.ToRadians((float)pitchDeg);
+    float roll = MathHelper.ToRadians((float)rollDeg);
+    MatrixD m = MatrixD.CreateFromYawPitchRoll(yaw, pitch, roll);
+    forward = m.Forward;
+    up = m.Up;
+    return true;
+}
+
 void OutputPathStatus() { 
     if (lcdPath == null) return; 
     string outText = isSoftLocked ? $"[LOCKED - STEP {setupStep}]\n" : "";
@@ -226,7 +348,12 @@ void OutputPathStatus() {
     outText += $"Max Speed: {(pathMaxSpeed >= 0 ? pathMaxSpeed.ToString("0.##") : "N/A")}\n";
     outText += $"Runtime: {Runtime.LastRunTimeMs:0.000} ms\n";
     outText += $"Instr: {Runtime.CurrentInstructionCount}/{Runtime.MaxInstructionCount}\n"; 
-    if (recordingActive) outText += recordingPaused ? "[RECORDING PAUSED]\n" : "[RECORDING]\n"; 
+    if (recordingActive) {
+        if (recordingPaused) outText += "[RECORDING PAUSED]\n";
+        else if (recordingAwaitingConfirm) outText += "[RECORDING AWAITING CONFIRM]\n";
+        else outText += "[RECORDING]\n";
+    }
+    if (autoState != AutoState.Off) outText += $"[AUTO RETURN: {autoState}]\n";
     lcdPath.ContentType = VRage.Game.GUI.TextPanel.ContentType.TEXT_AND_IMAGE; lcdPath.WriteText(outText); 
 } 
 
@@ -236,7 +363,7 @@ void HandleConfirmedEntry(string msg) {
     if (lcdConfirm != null) { lcdConfirm.ContentType = VRage.Game.GUI.TextPanel.ContentType.TEXT_AND_IMAGE; lcdConfirm.WriteText(output); } 
     if (indicatorLight != null) { indicatorLight.Color = blinkColor; indicatorLight.Enabled = true; blinkRequested = true; blinkTicks = 0; } 
     if (soundBlock != null) { soundBlock.SelectedSound = "Alert 2"; soundBlock.Play(); } 
-    if (recordingActive) { Vector3D p; if (TryParseGPS(parts[2], out p)) { recordingLastGPS = p; recordingTimer = 0; recordingPaused = false; } } 
+    if (recordingActive) { Vector3D p; if (TryParseGPS(parts[2], out p)) { recordingLastGPS = p; recordingTimer = 0; recordingPaused = false; recordingAwaitingConfirm = false; } } 
 } 
 
 void StopOverrides() { StopThrusterOverrides(); gyroControl?.Reset(); }
